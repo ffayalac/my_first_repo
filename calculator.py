@@ -1,3 +1,4 @@
-def calculadora(x,y):
-    z = x + y
-    return z
+def calculator(a,b):
+    x = a + b
+    return x
+    

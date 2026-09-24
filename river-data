@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+========================================================================
+SENTINEL AUTO-DOWNLOADER & RASTER CLIPPER - GUI INTERFACE
+TFM - SDR Analysis / University of Granada / Daira Isabel Colque
+========================================================================
+Herramienta avanzada para automatizar la descarga de imágenes Sentinel-2
+desde Copernicus Data Space Ecosystem, cálculo de NDVI, organización
+estacional por carpetas y recorte exacto a la máscara DTM (.asc).
+"""
+
+import os
+import sys
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from datetime import datetime, timedelta
+
+from sentinelhub import SHConfig, SentinelHubRequest, CRS, BBox, bbox_to_dimensions
+from sentinel_raster_clipper import process_raster_directory
+
+class SentinelClipperGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Sentinel NDVI Auto-Downloader & Clipper - TFM SDR")
+        self.root.geometry("900x820")
+        self.root.minsize(750, 720)
+        
+        default_base = '/Users/daira_isabel/Documents/TFM/codigo/SDR_code_Millares_2026'
+        self.input_dir_var = tk.StringVar(value=os.path.join(default_base, '1_Input_files', 'descargas_sentinel'))
+        self.mask_path_var = tk.StringVar(value=os.path.join(default_base, '1_Input_files', '1_DTM_30.asc'))
+        self.output_dir_var = tk.StringVar(value=os.path.join(default_base, '1_Input_files', 'archivo_ndvi_asc'))
+        
+        self.client_id_var = tk.StringVar(value='')
+        self.client_secret_var = tk.StringVar(value='')
+        self.year_start_var = tk.StringVar(value='2022')
+        self.year_end_var = tk.StringVar(value='2025')
+        self.max_clouds_var = tk.StringVar(value='10')
+        self.epsg_var = tk.StringVar(value='32630') 
+        self.season_var = tk.StringVar(value='todas') 
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+
+        main_frame = ttk.Frame(self.root, padding="15 15 15 15")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        title_label = tk.Label(
+            main_frame, 
+            text="Descarga Inteligente Sentinel-2 + Recorte DTM a Formato ASC", 
+            font=("Helvetica", 14, "bold"), 
+            fg="#1e3a8a"
+        )
+        title_label.pack(anchor="w", pady=(0, 10))
+
+        # Panel Informativo Técnico (Bandas, Ecuación y Proceso de Extracción)
+        info_group = ttk.LabelFrame(main_frame, text=" ℹ️ Ficha Técnica de Extracción y Fórmula NDVI ", padding="10 10 10 10")
+        info_group.pack(fill=tk.X, pady=(0, 10))
+
+        info_text = (
+            "• Satélite: Sentinel-2 (L2A - Corrección Atmosférica Bottom-Of-Atmosphere)\n"
+            "• Bandas Utilizadas: B08 (NIR - Infrarrojo Cercano, ~842 nm) y B04 (RED - Rojo Visible, ~665 nm) [Resolución: 10m]\n"
+            "• Ecuación NDVI: NDVI = (B08 - B04) / (B08 + B04) | Rango válido: [-1, +1]\n"
+            "• Filtro de Datos: Nubes, sombras y bordes sin datos se asignan automáticamente a NoData (-9999)\n"
+            "• Mosaicado: Mosaico de mínima cobertura nubosa ('leastCC') por ventana de 25 días por estación"
+        )
+        lbl_info = tk.Label(info_group, text=info_text, font=("Helvetica", 9), justify="left", fg="#334155", bg="#f1f5f9", anchor="w", padx=8, pady=6)
+        lbl_info.pack(fill=tk.X)
+
+        # 1. Credenciales Copernicus
+        api_group = ttk.LabelFrame(main_frame, text=" 1. Credenciales Copernicus Data Space Ecosystem ", padding="10 10 10 10")
+        api_group.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(api_group, text="Client ID:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(api_group, textvariable=self.client_id_var, width=35).grid(row=0, column=1, padx=5, sticky="w")
+        
+        ttk.Label(api_group, text="Client Secret:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(api_group, textvariable=self.client_secret_var, width=50, show="*").grid(row=1, column=1, padx=5, sticky="w")
+
+        # 2. Configuración Espacio-Temporal
+        time_group = ttk.LabelFrame(main_frame, text=" 2. Configuración Espacio-Temporal ", padding="10 10 10 10")
+        time_group.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(time_group, text="Año Inicio:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(time_group, textvariable=self.year_start_var, width=10).grid(row=0, column=1, sticky="w", padx=5)
+        
+        ttk.Label(time_group, text="Año Fin:").grid(row=0, column=2, sticky="e", padx=5)
+        ttk.Entry(time_group, textvariable=self.year_end_var, width=10).grid(row=0, column=3, sticky="w")
+
+        ttk.Label(time_group, text="Nubes Máx (%):").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Entry(time_group, textvariable=self.max_clouds_var, width=10).grid(row=1, column=1, sticky="w", padx=5)
+
+        ttk.Label(time_group, text="EPSG Máscara:").grid(row=1, column=2, sticky="e", padx=5)
+        ttk.Entry(time_group, textvariable=self.epsg_var, width=10).grid(row=1, column=3, sticky="w")
+
+        ttk.Label(time_group, text="Estación:").grid(row=2, column=0, sticky="w", pady=5)
+        season_cb = ttk.Combobox(
+            time_group, 
+            textvariable=self.season_var, 
+            values=['todas', 'invierno', 'primavera', 'verano', 'otoño'], 
+            state="readonly",
+            width=15
+        )
+        season_cb.grid(row=2, column=1, sticky="w", padx=5, pady=5)
+
+        # 3. Rutas
+        input_group = ttk.LabelFrame(main_frame, text=" 3. Rutas de Archivos Locales ", padding="10 10 10 10")
+        input_group.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(input_group, text="Máscara DTM (.asc):").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Entry(input_group, textvariable=self.mask_path_var, width=45).grid(row=0, column=1, padx=5, sticky="ew")
+        ttk.Button(input_group, text="Buscar...", command=self.browse_mask_path).grid(row=0, column=2)
+
+        ttk.Label(input_group, text="Guardar TIFFs en:").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Entry(input_group, textvariable=self.input_dir_var, width=45).grid(row=1, column=1, padx=5, sticky="ew")
+        ttk.Button(input_group, text="Buscar...", command=self.browse_input_dir).grid(row=1, column=2)
+
+        ttk.Label(input_group, text="Carpeta Final ASC:").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Entry(input_group, textvariable=self.output_dir_var, width=45).grid(row=2, column=1, padx=5, sticky="ew")
+        ttk.Button(input_group, text="Buscar...", command=self.browse_output_dir).grid(row=2, column=2)
+        input_group.columnconfigure(1, weight=1)
+
+        # Acciones
+        action_frame = ttk.Frame(main_frame)
+        action_frame.pack(fill=tk.X, pady=(5, 5))
+
+        self.btn_run = tk.Button(
+            action_frame, 
+            text="▶ INICIAR DESCARGA Y PROCESAMIENTO", 
+            font=("Helvetica", 11, "bold"), 
+            bg="#2563eb", 
+            fg="white", 
+            activebackground="#1d4ed8",
+            activeforeground="white",
+            pady=8,
+            padx=8,
+            command=self.start_processing
+        )
+        self.btn_run.pack(fill=tk.X)
+        
+        self.progress = ttk.Progressbar(action_frame, mode='indeterminate')
+        self.progress.pack(fill=tk.X, pady=(8, 0))
+
+        # Consola
+        log_group = ttk.LabelFrame(main_frame, text=" Consola de Ejecución ", padding="5 5 5 5")
+        log_group.pack(fill=tk.BOTH, expand=True)
+
+        self.log_text = tk.Text(log_group, wrap=tk.WORD, font=("Courier", 10), bg="#1e293b", fg="#f8fafc")
+        scrollbar = ttk.Scrollbar(log_group, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def browse_input_dir(self):
+        path = filedialog.askdirectory()
+        if path: self.input_dir_var.set(path)
+
+    def browse_mask_path(self):
+        path = filedialog.askopenfilename(filetypes=[("Archivos ASCII Grid", "*.asc")])
+        if path: self.mask_path_var.set(path)
+
+    def browse_output_dir(self):
+        path = filedialog.askdirectory()
+        if path: self.output_dir_var.set(path)
+
+    def log(self, message):
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+
+    def read_asc_bbox(self, asc_path):
+        with open(asc_path, 'r') as f:
+            lines = f.readlines()
+        ncols = int(lines[0].split()[1])
+        nrows = int(lines[1].split()[1])
+        xll = float(lines[2].split()[1])
+        yll = float(lines[3].split()[1])
+        cellsize = float(lines[4].split()[1])
+        
+        min_x = xll
+        max_x = xll + (ncols * cellsize)
+        min_y = yll
+        max_y = yll + (nrows * cellsize)
+        return min_x, min_y, max_x, max_y
+
+    def start_processing(self):
+        os.makedirs(self.input_dir_var.get(), exist_ok=True)
+        os.makedirs(self.output_dir_var.get(), exist_ok=True)
+
+        self.btn_run.config(state=tk.DISABLED)
+        self.progress.start(10)
+        self.log_text.delete(1.0, tk.END)
+
+        thread = threading.Thread(target=self.run_process_thread, daemon=True)
+        thread.start()
+
+    def run_process_thread(self):
+        class StdoutRedirector:
+            def __init__(self, gui): self.gui = gui
+            def write(self, text):
+                if text.strip(): self.gui.root.after(0, self.gui.log, text.rstrip())
+            def flush(self): pass
+
+        sys.stdout = StdoutRedirector(self)
+        try:
+            self.download_sentinel()
+            print("\n=======================================")
+            print("DESCARGA COMPLETADA. INICIANDO RECORTE A MÁSCARA DTM...")
+            print("=======================================")
+            
+            count = process_raster_directory(
+                input_dir=self.input_dir_var.get(),
+                mask_path=self.mask_path_var.get(),
+                output_dir=self.output_dir_var.get(),
+                season_filter=self.season_var.get(),
+                verbose=True
+            )
+            self.root.after(0, self.on_process_complete, True, f"Proceso completado con éxito. {count} archivos ASC generados.")
+        except Exception as e:
+            self.root.after(0, self.on_process_complete, False, f"Ocurrió un error general:\n{str(e)}")
+        finally:
+            sys.stdout = sys.__stdout__
+
+    def download_sentinel(self):
+        client_id = self.client_id_var.get().strip()
+        client_secret = self.client_secret_var.get().strip()
+
+        if not client_id or not client_secret:
+            raise ValueError("Por favor introduce las credenciales Client ID y Client Secret de Copernicus Data Space.")
+
+        print("Autenticando en Copernicus Data Space Ecosystem (sh.dataspace.copernicus.eu)...")
+        
+        config = SHConfig()
+        config.sh_client_id = client_id
+        config.sh_client_secret = client_secret
+        config.sh_base_url = "https://sh.dataspace.copernicus.eu"
+        config.sh_token_url = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+        
+        print("Leyendo coordenadas de tu máscara DTM...")
+        min_x, min_y, max_x, max_y = self.read_asc_bbox(self.mask_path_var.get())
+        
+        epsg_code = self.epsg_var.get().strip()
+        roi_bbox = BBox(bbox=[min_x, min_y, max_x, max_y], crs=CRS(f"EPSG:{epsg_code}"))
+        size = bbox_to_dimensions(roi_bbox, resolution=10)
+
+        # Evalscript v3 para cálculo de NDVI directo en servidor Copernicus
+        evalscript = """
+        //VERSION=3
+        function setup() {
+            return {
+                input: ["B04", "B08", "dataMask"],
+                output: { id: "default", bands: 1, sampleType: "FLOAT32" }
+            };
+        }
+        function evaluatePixel(sample) {
+            // Si el satélite detecta que no hay datos válidos (bordes del satélite)
+            if (sample.dataMask === 0) return [-9999];
+            
+            let ndvi = (sample.B08 - sample.B04) / (sample.B08 + sample.B04);
+            
+            // Si la fórmula da error o valores irreales por nubes densas
+            if (ndvi <= -0.9 || isNaN(ndvi)) return [-9999];
+            
+            return [ndvi]; 
+        }
+        """
+        
+        year_start = int(self.year_start_var.get())
+        year_end = int(self.year_end_var.get())
+        max_cc = float(self.max_clouds_var.get())
+        selected_season = self.season_var.get().lower().replace('otoño', 'otono')
+
+        all_seasons = {
+            'invierno': [(1,1), (2,1), (3,1)],
+            'primavera': [(4,1), (5,1), (6,1)],
+            'verano': [(7,1), (8,1), (9,1)],
+            'otono': [(10,1), (11,1), (12,1)]
+        }
+        
+        if selected_season != 'todas':
+            seasons_to_process = {selected_season: all_seasons.get(selected_season, all_seasons['otono'])}
+        else:
+            seasons_to_process = all_seasons
+
+        base_input_dir = self.input_dir_var.get()
+
+        for year in range(year_start, year_end + 1):
+            for season, start_dates in seasons_to_process.items():
+                season_dir_name = 'otoño' if season == 'otono' else season
+                print(f"\n--- Buscando estación [{season_dir_name.upper()}] - Año {year} ---")
+                
+                # Crear subcarpeta estacional para mantener todo organizado desde la descarga
+                season_input_folder = os.path.join(base_input_dir, season_dir_name)
+                os.makedirs(season_input_folder, exist_ok=True)
+
+                for i, (month, day) in enumerate(start_dates):
+                    start_time = f"{year}-{month:02d}-{day:02d}"
+                    end_time_dt = datetime(year, month, day) + timedelta(days=25)
+                    end_time = end_time_dt.strftime("%Y-%m-%d")
+                    
+                    filename = f"NDVI_{year}_{season_dir_name}_mes{month:02d}.tif"
+                    filepath = os.path.join(season_input_folder, filename)
+                    
+                    if os.path.exists(filepath):
+                        print(f"✓ Ya existe {filename}, saltando descarga...")
+                        continue
+                        
+                    print(f"Descargando mes {month:02d} ({start_time} al {end_time})...")
+                    
+                    input_data_raw = [{
+                        "type": "sentinel-2-l2a",
+                        "dataFilter": {
+                            "timeRange": {
+                                "from": f"{start_time}T00:00:00Z",
+                                "to": f"{end_time}T23:59:59Z"
+                            },
+                            "maxCloudCoverage": max_cc,
+                            "mosaickingOrder": "leastCC"
+                        }
+                    }]
+                    
+                    responses_raw = [{
+                        "identifier": "default",
+                        "format": {"type": "image/tiff"}
+                    }]
+                    
+                    request = SentinelHubRequest(
+                        evalscript=evalscript,
+                        input_data=input_data_raw,
+                        responses=responses_raw,
+                        bbox=roi_bbox,
+                        size=size,
+                        config=config
+                    )
+                    
+                    try:
+                        response = request.get_data(decode_data=False) 
+                        if response and len(response) > 0:
+                            file_bytes = response[0].content 
+                            if len(file_bytes) < 1000 and (b'error' in file_bytes.lower() or b'html' in file_bytes.lower()):
+                                print(f"❌ Error devuelto por Copernicus: {file_bytes.decode('utf-8', errors='ignore')}")
+                            else:
+                                with open(filepath, 'wb') as f:
+                                    f.write(file_bytes)
+                                print(f"✅ Guardado con éxito en subcarpeta '{season_dir_name}': {filename}")
+                    except Exception as e:
+                        print(f"❌ Error de conexión al descargar {filename}: {str(e)}")
+
+    def on_process_complete(self, success, message):
+        self.progress.stop()
+        self.btn_run.config(state=tk.NORMAL)
+        if success:
+            messagebox.showinfo("Éxito", message)
+        else:
+            messagebox.showerror("Error", f"Ocurrió un error:\n{message}")
+
+def main():
+    root = tk.Tk()
+    app = SentinelClipperGUI(root)
+    root.mainloop()
+
+if __name__ == '__main__':
+    main()
